@@ -26,12 +26,18 @@ REQUIRED_FIELDS = [
     "severity",
     "detected_environment",
     "rel_eno_id",
+    "rel_name",
+    "rel_title",
+    "rel_level_id",
     "feature_eno_id",
+    "feature_name",
     "detection_level_eno_id",
+    "detection_level_name",
+    "detection_level_title",
     "default_clarifier",
     "default_corrector",
     "default_validator",
-]
+]  # mandatory in POST /incidentfamilies (see /openapi.json)
 
 DSX_CREATE_KEYS = [
     "title",
@@ -170,7 +176,10 @@ def _parse_create_response(body: Any) -> dict[str, Any]:
 def create_incident_report(dsx: DsxSession, payload: dict[str, Any]) -> dict[str, Any]:
     form = prepare_ir_payload(dsx, payload, for_create=True)
     url = join_devops("/incidentfamilies")
-    resp = _request(dsx, url, method="POST", data=form)
+    # POST /incidentfamilies only accepts multipart/form-data (urlencoded gives HTTP 415), so send
+    # every field as a multipart part: (None, value) means "plain field, no filename".
+    parts = {key: (None, value) for key, value in form.items()}
+    resp = _request(dsx, url, method="POST", files=parts)
     if resp.status_code >= 400:
         detail: Any
         try:

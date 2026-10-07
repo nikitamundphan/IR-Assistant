@@ -83,7 +83,7 @@ const FALLBACK_FORM_SECTIONS = [
         key: "detection_level_name",
         label: "Issue detected version",
         prompt: "Which version did you detect this issue in?",
-        hint: "Program code or version label (e.g. PRG044546). The ID is looked up automatically.",
+        hint: "Version name, program code, or the object's ID. The rest is looked up automatically.",
         placeholder: "e.g. PRG044546",
         type: "text",
       },
@@ -339,6 +339,10 @@ const LINKED_FIELD_LABELS = {
 };
 
 function applyLinkedFieldUpdate(fields, key, value) {
+  // Re-typing the same value must keep the linked id: several objects can share one name.
+  if (String(fields[key] ?? "").trim() === String(value ?? "").trim() && fields[key] !== undefined) {
+    return { ...fields, [key]: value };
+  }
   const next = { ...fields, [key]: value };
   for (const { displayKeys, enoKey } of LINKED_FIELD_GROUPS) {
     if (displayKeys.includes(key)) {
@@ -462,9 +466,24 @@ function applyBaselineOidsForUneditedSections(payload, baseline, editedSections)
   }
 }
 
-function buildLinkErrorMessage(parts) {
+const LINKED_LABEL_VALUE_KEYS = {
+  "Target release": ["rel_title", "rel_name"],
+  Feature: ["feature_name"],
+  "Detection program": ["detection_level_title", "detection_level_name"],
+};
+
+function buildLinkErrorMessage(parts, merged = {}) {
   const unique = [...new Set(parts)];
-  let hint = "Check those fields in the review panel.";
+  const values = unique
+    .map((label) => {
+      const key = (LINKED_LABEL_VALUE_KEYS[label] || []).find((k) => merged[k]);
+      return key ? `${label} "${merged[key]}"` : "";
+    })
+    .filter(Boolean);
+  const valueNote = values.length > 0
+    ? ` DSX did not find: ${values.join(", ")}. Type the exact name or the object's ID (32 characters) with **Change something**.`
+    : "";
+  let hint = `Check those fields in the review panel.${valueNote}`;
   const needsDashboard = unique.some(
     (part) => part === "Target release" || part === "Detection program",
   );
@@ -723,13 +742,17 @@ export default function IRChatbot() {
         || releaseFields.rel_name
         || query;
       const relId = releaseFields.rel_eno_id || "";
+      // A typed version ("Service.1.11.6") sets its parent release as the target release and the
+      // version itself as the default detected version.
+      const versionDetection = resolved.detection_fields || null;
       const context = {
         releaseFields,
         releaseLabel: relLabel,
         releaseResolvedByName: true,
+        ...(versionDetection ? { detectionFields: versionDetection } : {}),
       };
       setServiceContext((prev) => ({ ...(prev || {}), ...context }));
-      const contextFields = { ...releaseFields };
+      const contextFields = { ...releaseFields, ...(versionDetection || {}) };
       setSavedFields((prev) => ({ ...prev, ...contextFields }));
       setBaselineFields((prev) => ({ ...prev, ...contextFields }));
 
@@ -740,6 +763,9 @@ export default function IRChatbot() {
       const successMessage = (
         `Target release **${relLabel}** is set.\n\n`
         + `**Release ID for IR filing:** \`${relId}\`${navLine}\n\n`
+        + (versionDetection
+          ? `**${query}** is a version, so its release is the target and the version is the default **detected version**: ${versionDetection.detection_level_title}.\n\n`
+          : "")
         + "You can now create an IR from the main menu (saved form or without saved form)."
       );
       setReleaseNameInput("");
@@ -1609,7 +1635,7 @@ export default function IRChatbot() {
         return {
           ok: false,
           merged: nextMerged,
-          message: buildLinkErrorMessage(parts),
+          message: buildLinkErrorMessage(parts, nextMerged),
         };
       }
       return { ok: true, merged: nextMerged };
@@ -1631,7 +1657,7 @@ export default function IRChatbot() {
       sectionLabel: "Issue detected version",
       sectionIntro: "Confirm or update the version where you actually found this issue.",
       prompt: "Which version did you actually detect this issue in?",
-      hint: "Program code or version label (e.g. PRG044546). The ID is looked up automatically.",
+      hint: "Version name, program code, or the object's ID. The rest is looked up automatically.",
       placeholder: "e.g. PRG044546",
       default: defaultName,
       isFirstInSection: true,

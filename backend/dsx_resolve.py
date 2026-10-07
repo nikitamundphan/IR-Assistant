@@ -11,15 +11,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 from backend.dsx_http import (
     fetch_by_eno_id,
+    fetch_by_physical_id,
     fetch_features,
     fetch_program_by_name,
     fetch_programs,
     fetch_release_by_id,
     fetch_releases,
+    search_by_title,
     search_releases_global,
 )
-from backend.dsx_util import ENO_OID_PATTERN, best_match, pick_id, pick_name, pick_title
+from backend.dsx_util import ENO_OID_PATTERN, PHYSICAL_ID_PATTERN, normalize_list_item, pick_id, pick_name, pick_title
 from backend.sessions import DsxSession
+
+# Where a typed "issue detected version" is looked up. The IR itself needs a program, so programs
+# come first and a version found in /regulars is mapped to its program (program_of_version).
+DETECTION_ENDPOINTS = ("/programs", "/regulars")
 
 
 def release_fields_from_item(item: dict[str, Any]) -> dict[str, str]:
@@ -42,7 +48,23 @@ def release_fields_from_item(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def program_of_version(item: dict[str, Any]) -> dict[str, Any]:
+    """DSX only accepts a program as the IR's detected level. For a version (/regulars item), use
+    the program embedded in it (e.g. version X.1.11.6 -> program titled X-1.11.6)."""
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else item
+    if str(raw.get("type") or "") != "DSXRel_Regular":
+        return item
+    programs = raw.get("program")
+    if isinstance(programs, dict):
+        programs = [programs]
+    for prog in programs or []:
+        if isinstance(prog, dict) and pick_id(prog):
+            return normalize_list_item(prog)
+    return item
+
+
 def detection_fields_from_program(program: dict[str, Any]) -> dict[str, str]:
+    program = program_of_version(program)
     raw = program.get("raw") if isinstance(program.get("raw"), dict) else program
     pid = pick_id(program) or pick_id(raw)
     pname = pick_name(program) or pick_name(raw)
@@ -70,9 +92,17 @@ def resolve_release_by_query(dsx: DsxSession, query: str) -> dict[str, Any]:
             },
         )
 
-    release_fields = release_fields_from_item(match)
+    # A typed version (e.g. "Service.1.11.6") is a /regulars object, not a release: the IR's target
+    # release is the release that version belongs to, and the version itself is the detected version.
+    version = None
+    parent = parent_release_of_version(match)
+    if parent:
+        version = match
+        release_fields = release_fields_for_parent(dsx, parent)
+    else:
+        release_fields = release_fields_from_item(match)
     rel_id = release_fields.get("rel_eno_id") or ""
-    return {
+    result = {
         "resolved": True,
         "query": q,
         "release": {
@@ -84,6 +114,41 @@ def resolve_release_by_query(dsx: DsxSession, query: str) -> dict[str, Any]:
         "navigator_url": navigator_url(rel_id) or None,
         "probe": probe.summary(),
     }
+    if version:
+        result["detection_fields"] = detection_fields_from_program(version)
+        result["version"] = {"id": pick_id(version), "title": pick_title(version), "name": pick_name(version)}
+    return result
+
+
+def parent_release_of_version(version: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """The release object embedded in a /regulars item (None if the item is not a version)."""
+    raw = version.get("raw") if isinstance(version.get("raw"), dict) else version
+    release = raw.get("release")
+    if isinstance(release, list):
+        release = release[0] if release else None
+    return release if isinstance(release, dict) and pick_id(release) else None
+
+
+def release_fields_for_parent(dsx: DsxSession, parent: dict[str, Any]) -> dict[str, str]:
+    """Release fields for a version's parent release, read from GET /releases/{id} when possible."""
+    item = fetch_release_by_id(dsx, pick_id(parent))
+    return release_fields_from_item(item or parent)
+
+
+def swap_version_for_release(dsx: DsxSession, fields: dict[str, Any]) -> dict[str, Any]:
+    """If rel_eno_id is really a version's id, use that version's release (DSX rejects non-releases)."""
+    out = dict(fields)
+    rel_id = str(out.get("rel_eno_id") or "").strip()
+    if not PHYSICAL_ID_PATTERN.match(rel_id):
+        return out
+    version = fetch_by_physical_id(dsx, ("/regulars",), rel_id)
+    parent = parent_release_of_version(version) if version else None
+    if not parent:
+        return out
+    out.update(release_fields_for_parent(dsx, parent))
+    if not out.get("detection_level_eno_id"):
+        out.update(detection_fields_from_program(version))
+    return out
 
 
 def enrich_release_fields(dsx: DsxSession, fields: dict[str, str]) -> dict[str, str]:
@@ -158,20 +223,20 @@ def resolve_detection_level(
     resolved = False
 
     if query:
-        program = fetch_program_by_name(dsx, query, service_id=service_id, brand_id=brand_id)
-        if program:
-            fields = detection_fields_from_program(program)
+        # The detected version is a /regulars object (or a program). A typed physical id is looked
+        # up directly; anything else is matched by the title/name the user typed.
+        match = fetch_by_physical_id(dsx, DETECTION_ENDPOINTS, query)
+        if not match:
+            found, _probe = search_by_title(dsx, DETECTION_ENDPOINTS, query)
+            match = found[0] if found else None
+        if not match:
+            try:  # scoped program list is slow on DSX; a failure here just means "not found"
+                match = fetch_program_by_name(dsx, query, service_id=service_id, brand_id=brand_id)
+            except HTTPException:
+                match = None
+        if match:
+            fields = detection_fields_from_program(match)
             resolved = bool(fields.get("detection_level_eno_id"))
-        if not resolved:
-            features = fetch_features(dsx, query)
-            feat = best_match(query, features)
-            if feat:
-                fields = {
-                    "detection_level_eno_id": pick_id(feat),
-                    "detection_level_name": pick_name(feat) or pick_title(feat),
-                    "detection_level_title": pick_title(feat) or pick_name(feat),
-                }
-                resolved = bool(fields.get("detection_level_eno_id"))
 
     if not resolved and query:
         fields = {
@@ -201,9 +266,11 @@ def resolve_eno_ids(dsx: DsxSession, fields: dict[str, Any]) -> dict[str, Any]:
 
     ref = str(out.get("detection_level_eno_id") or "")
     if ENO_OID_PATTERN.match(ref):
-        item = fetch_by_eno_id(dsx, "/programs", ref)
-        if item:
-            out.update(detection_fields_from_program(item))
+        for endpoint in DETECTION_ENDPOINTS:
+            item = fetch_by_eno_id(dsx, endpoint, ref)
+            if item:
+                out.update(detection_fields_from_program(item))
+                break
     return out
 
 
@@ -217,7 +284,7 @@ def resolve_form_templates(dsx: DsxSession, forms: list[dict[str, Any]]) -> list
 
 
 def resolve_ir_references(dsx: DsxSession, payload: dict[str, Any]) -> dict[str, Any]:
-    fields = resolve_eno_ids(dsx, payload)
+    fields = swap_version_for_release(dsx, resolve_eno_ids(dsx, payload))
     service_id = str(payload.get("service_id") or "").strip()
     brand_id = str(payload.get("brand_id") or "").strip()
 
@@ -233,8 +300,10 @@ def resolve_ir_references(dsx: DsxSession, payload: dict[str, Any]) -> dict[str,
     if not fields.get("feature_eno_id"):
         feature_query = str(payload.get("feature_name") or "").strip()
         if feature_query:
-            features = fetch_features(dsx, feature_query)
-            feat = best_match(feature_query, features)
+            feat = fetch_by_physical_id(dsx, ("/features",), feature_query)
+            if not feat:
+                features = fetch_features(dsx, feature_query)
+                feat = features[0] if features else None
             if feat:
                 fields["feature_eno_id"] = pick_id(feat)
                 fields["feature_name"] = pick_title(feat) or pick_name(feat)
@@ -248,6 +317,19 @@ def resolve_ir_references(dsx: DsxSession, payload: dict[str, Any]) -> dict[str,
             brand_id=brand_id,
         )
         fields.update(det.get("fields") or {})
+
+    # The physical id is the source of truth: the API needs the matching names too, so always read
+    # them from the object itself instead of trusting names left over from the saved form.
+    feature_id = str(fields.get("feature_eno_id") or "")
+    if PHYSICAL_ID_PATTERN.match(feature_id):
+        feat = fetch_by_physical_id(dsx, ("/features",), feature_id)
+        if feat:
+            fields["feature_name"] = pick_title(feat) or pick_name(feat)
+    detection_id = str(fields.get("detection_level_eno_id") or "")
+    if PHYSICAL_ID_PATTERN.match(detection_id):
+        det_item = fetch_by_physical_id(dsx, DETECTION_ENDPOINTS, detection_id)
+        if det_item:
+            fields.update(detection_fields_from_program(det_item))
 
     fields = enrich_release_fields(dsx, {k: str(v) for k, v in fields.items() if v is not None and str(v).strip()})
     return {"fields": fields}

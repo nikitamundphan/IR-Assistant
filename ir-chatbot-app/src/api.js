@@ -1,5 +1,53 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
+// Sessions live in the server's memory, so a server restart makes the browser's saved session id
+// invalid ("Invalid or expired session"). When that happens, quietly sign in again as the same
+// user (env login) and retry the request once, instead of failing in the middle of a chat.
+const renewedSessions = new Map();
+let renewing = null;
+
+async function renewSession(oldId) {
+  if (!renewing) {
+    renewing = (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/login/env`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (!res.ok) return "";
+        const body = await res.json();
+        // Never switch the signed-in user behind their back.
+        if (body.username !== localStorage.getItem("ir_username")) return "";
+        localStorage.setItem("ir_session_id", body.session_id);
+        return body.session_id;
+      } catch {
+        return "";
+      } finally {
+        setTimeout(() => { renewing = null; }, 0);
+      }
+    })();
+  }
+  const fresh = await renewing;
+  if (fresh) renewedSessions.set(oldId, fresh);
+  return fresh;
+}
+
+async function apiFetch(url, init = {}) {
+  const headers = { ...(init.headers || {}) };
+  const original = headers["X-Session-Id"];
+  if (original && renewedSessions.has(original)) headers["X-Session-Id"] = renewedSessions.get(original);
+
+  const res = await fetch(url, { ...init, headers });
+  if (res.status !== 401 || !original) return res;
+
+  const body = await res.clone().json().catch(() => ({}));
+  if (!/expired session/i.test(String(body.detail || ""))) return res;
+
+  const fresh = await renewSession(original);
+  if (!fresh) return res;
+  return fetch(url, { ...init, headers: { ...headers, "X-Session-Id": fresh } });
+}
+
 function authHeaders(sessionId) {
   const headers = { "Content-Type": "application/json" };
   if (sessionId) headers["X-Session-Id"] = sessionId;
@@ -92,7 +140,7 @@ async function parseError(res) {
 }
 
 export async function fetchHealth() {
-  const res = await fetch(`${API_BASE}/api/health`);
+  const res = await apiFetch(`${API_BASE}/api/health`);
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
@@ -107,7 +155,7 @@ export function buildDsxNavigatorUrl(health, physicalId) {
 }
 
 export async function login(username, password) {
-  const res = await fetch(`${API_BASE}/api/login`, {
+  const res = await apiFetch(`${API_BASE}/api/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ username, password }),
@@ -117,7 +165,7 @@ export async function login(username, password) {
 }
 
 export async function loginFromEnv() {
-  const res = await fetch(`${API_BASE}/api/login/env`, {
+  const res = await apiFetch(`${API_BASE}/api/login/env`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -126,26 +174,26 @@ export async function loginFromEnv() {
 }
 
 export async function logout(sessionId) {
-  await fetch(`${API_BASE}/api/logout`, {
+  await apiFetch(`${API_BASE}/api/logout`, {
     method: "POST",
     headers: authHeaders(sessionId),
   });
 }
 
 export async function fetchMe(sessionId) {
-  const res = await fetch(`${API_BASE}/api/me`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/me`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function fetchIrFieldSchema() {
-  const res = await fetch(`${API_BASE}/api/ir-field-schema`);
+  const res = await apiFetch(`${API_BASE}/api/ir-field-schema`);
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function fetchDsxBrands(sessionId) {
-  const res = await fetch(`${API_BASE}/api/dsx/brands`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/dsx/brands`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
@@ -155,7 +203,7 @@ export async function fetchDsxServices(sessionId, brandId = "") {
   if (brandId) params.set("brand_id", brandId);
   const query = params.toString();
   const url = `${API_BASE}/api/dsx/services${query ? `?${query}` : ""}`;
-  const res = await fetch(url, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(url, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
@@ -166,20 +214,20 @@ export async function fetchDsxPrograms(sessionId, { serviceId = "", brandId = ""
   if (brandId) params.set("brand_id", brandId);
   const query = params.toString();
   if (!query) throw new Error("serviceId or brandId is required");
-  const res = await fetch(`${API_BASE}/api/dsx/programs?${query}`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/dsx/programs?${query}`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function fetchDsxReleases(sessionId, programId) {
   const params = new URLSearchParams({ program_id: programId });
-  const res = await fetch(`${API_BASE}/api/dsx/releases?${params}`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/dsx/releases?${params}`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function resolveReleaseContext(sessionId, payload) {
-  const res = await fetch(`${API_BASE}/api/dsx/resolve-release-context`, {
+  const res = await apiFetch(`${API_BASE}/api/dsx/resolve-release-context`, {
     method: "POST",
     headers: authHeaders(sessionId),
     body: JSON.stringify(payload),
@@ -189,7 +237,7 @@ export async function resolveReleaseContext(sessionId, payload) {
 }
 
 export async function resolveDsxRelease(sessionId, payload) {
-  const res = await fetch(`${API_BASE}/api/dsx/resolve-release`, {
+  const res = await apiFetch(`${API_BASE}/api/dsx/resolve-release`, {
     method: "POST",
     headers: authHeaders(sessionId),
     body: JSON.stringify(payload),
@@ -199,7 +247,7 @@ export async function resolveDsxRelease(sessionId, payload) {
 }
 
 export async function resolveDetectionLevel(sessionId, payload) {
-  const res = await fetch(`${API_BASE}/api/dsx/resolve-detection-level`, {
+  const res = await apiFetch(`${API_BASE}/api/dsx/resolve-detection-level`, {
     method: "POST",
     headers: authHeaders(sessionId),
     body: JSON.stringify(payload),
@@ -209,19 +257,19 @@ export async function resolveDetectionLevel(sessionId, payload) {
 }
 
 export async function fetchSavedIrForms(sessionId) {
-  const res = await fetch(`${API_BASE}/api/saved-ir-forms`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/saved-ir-forms`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function fetchMyIncidents(sessionId) {
-  const res = await fetch(`${API_BASE}/api/my-incidents`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/my-incidents`, { headers: authHeaders(sessionId) });
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
 
 export async function resolveIrReferences(sessionId, payload) {
-  const res = await fetch(`${API_BASE}/api/resolve-ir-references`, {
+  const res = await apiFetch(`${API_BASE}/api/resolve-ir-references`, {
     method: "POST",
     headers: authHeaders(sessionId),
     body: JSON.stringify(payload),
@@ -231,7 +279,7 @@ export async function resolveIrReferences(sessionId, payload) {
 }
 
 export async function createIncidentReport(sessionId, payload) {
-  const res = await fetch(`${API_BASE}/api/create-ir`, {
+  const res = await apiFetch(`${API_BASE}/api/create-ir`, {
     method: "POST",
     headers: authHeaders(sessionId),
     body: JSON.stringify(payload),
@@ -244,7 +292,7 @@ export async function searchIncidentReports(sessionId, query, feature) {
   const params = new URLSearchParams();
   if (query) params.set("q", query);
   if (feature) params.set("feature", feature);
-  const res = await fetch(`${API_BASE}/api/search-ir?${params}`, { headers: authHeaders(sessionId) });
+  const res = await apiFetch(`${API_BASE}/api/search-ir?${params}`, { headers: authHeaders(sessionId) });
   if (!res.ok) return [];
   const body = await res.json();
   return body.items || [];
@@ -256,7 +304,7 @@ export async function uploadIrMedia(sessionId, irId, file, documentId) {
   const params = new URLSearchParams();
   if (documentId) params.set("document_id", documentId);
   const query = params.toString();
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/api/upload-ir-media/${encodeURIComponent(irId)}${query ? `?${query}` : ""}`,
     {
       method: "POST",

@@ -9,7 +9,7 @@ FastAPI backend: thin entry [`server.py`](server.py) → [`backend/`](backend/) 
 ```bash
 pip install -r requirements.txt
 cp env.example .env   # set DSX_BASE_URL, DSX_CREDENTIALS, and DSX_UI_BASE_URL
-uvicorn server:app --reload --port 3001
+uvicorn server:app --reload --reload-dir backend --port 3001   # sessions are in memory: a restart signs you out
 
 cd ir-chatbot-app
 npm install

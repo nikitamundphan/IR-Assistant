@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -24,6 +25,7 @@ from backend.config import (
     join_ui,
 )
 from backend.dsx_util import (
+    PHYSICAL_ID_PATTERN,
     ProbeLog,
     extract_items,
     normalize_catalog_items,
@@ -204,14 +206,21 @@ def fetch_releases(dsx: DsxSession, program_id: str) -> dict[str, Any]:
     return {"items": items, "hint": hint, "probe": probe.summary()}
 
 
-def search_releases_global(dsx: DsxSession, query: str) -> tuple[list[dict[str, Any]], ProbeLog]:
-    """Resolve the name the user typed to an object (version first, then release).
+SEARCH_CALL_TIMEOUT = 20  # seconds per lookup
+SEARCH_BUDGET_SECONDS = 45  # total time for one typed value
 
-    Looks in /regulars (a specific version, e.g. "Service.1.58.6") and then /releases, using
-    GET <endpoint>?title=<pattern>&is_extended=false. The server filter is case-sensitive and
+
+def search_by_title(
+    dsx: DsxSession,
+    endpoints: tuple[str, ...],
+    query: str,
+) -> tuple[list[dict[str, Any]], ProbeLog]:
+    """Resolve the name the user typed to objects on the given endpoints, first endpoint first.
+
+    Uses GET <endpoint>?title=<pattern> (and ?name=<text>). The server filter is case-sensitive and
     supports `*` and `?`, so the typed text is turned into a wildcard pattern (separators -> `*`,
-    and on a second try letters -> `?`) and the candidates are compared case-insensitively here.
-    A release code is also tried as `name`. Nothing about the text is hard-coded.
+    and on a second try letters -> `?`) and candidates are compared case-insensitively here.
+    Nothing about the text is hard-coded.
     """
     probe = ProbeLog()
     q = query.strip()
@@ -219,19 +228,29 @@ def search_releases_global(dsx: DsxSession, query: str) -> tuple[list[dict[str, 
     if not wanted:
         return [], probe
 
+    # Cheap exact lookups first; the wildcard scans (especially the any-case one, which starts with
+    # `?`) are slow on DSX, so they go last.
     attempts: list[tuple[str, str, str]] = []
-    patterns = [_wildcard(q, any_case=False), _wildcard(q, any_case=True)]
-    for pattern in dict.fromkeys(patterns):
-        for endpoint in ("/regulars", "/releases"):
-            attempts.append((endpoint, "title", pattern))
-    for endpoint in ("/regulars", "/releases"):
+    for endpoint in endpoints:
         attempts.append((endpoint, "name", q))
+        attempts.append((endpoint, "title", q))
+    for pattern in dict.fromkeys([_wildcard(q, any_case=False), _wildcard(q, any_case=True)]):
+        for endpoint in endpoints:
+            attempts.append((endpoint, "title", pattern))
+    attempts = list(dict.fromkeys(attempts))
 
+    started = time.monotonic()
     for endpoint, field, value in attempts:
-        if len(probe.entries) >= probe.max_attempts:
+        if len(probe.entries) >= probe.max_attempts or time.monotonic() - started > SEARCH_BUDGET_SECONDS:
             break
-        params = {field: value, "is_extended": "false"}
-        resp = _request(dsx, join_devops(endpoint), params=params)
+        params: dict[str, Any] = {field: value}
+        if endpoint in ("/releases", "/regulars"):
+            params["is_extended"] = "false"
+        try:
+            resp = _request(dsx, join_devops(endpoint), params=params, timeout=SEARCH_CALL_TIMEOUT)
+        except HTTPException:
+            probe.add(endpoint, params, 0, 0)  # timed out / unreachable: try the next lookup
+            continue
         body = _safe_json(resp)
         items = normalize_catalog_items(body) if resp.status_code < 400 else []
         probe.add(endpoint, params, resp.status_code, len(items))
@@ -239,6 +258,28 @@ def search_releases_global(dsx: DsxSession, query: str) -> tuple[list[dict[str, 
         if matches:
             return matches, probe
     return [], probe
+
+
+def search_releases_global(dsx: DsxSession, query: str) -> tuple[list[dict[str, Any]], ProbeLog]:
+    """Release target lookup: a specific version (/regulars) first, then /releases."""
+    return search_by_title(dsx, ("/regulars", "/releases"), query)
+
+
+def fetch_by_physical_id(dsx: DsxSession, endpoints: tuple[str, ...], physical_id: str) -> Optional[dict[str, Any]]:
+    """GET <endpoint>/<physicalId> on each endpoint until one knows the object."""
+    ref = physical_id.strip()
+    if not PHYSICAL_ID_PATTERN.match(ref):
+        return None
+    for endpoint in endpoints:
+        resp = _request(dsx, join_devops(f"{endpoint}/{ref.upper()}"))
+        if resp.status_code != 200:
+            continue
+        body = _safe_json(resp)
+        if isinstance(body, list):
+            body = body[0] if body else {}
+        if isinstance(body, dict) and (pick_id(body) or pick_title(body)):
+            return normalize_list_item(body)
+    return None
 
 
 def _compact(text: str) -> str:
@@ -290,18 +331,9 @@ def fetch_by_eno_id(dsx: DsxSession, endpoint: str, eno_id: str) -> Optional[dic
 
 
 def fetch_features(dsx: DsxSession, query: str) -> list[dict[str, Any]]:
-    probe = ProbeLog()
-    q = query.strip()
-    for params in ({"q": q}, {"search": q}, {"name": q}):
-        if len(probe.entries) >= probe.max_attempts:
-            break
-        resp = _request(dsx, join_devops("/features"), params=params)
-        body = _safe_json(resp)
-        chunk = normalize_catalog_items(body) if resp.status_code < 400 else []
-        probe.add("/features", params, resp.status_code, len(chunk))
-        if chunk:
-            return chunk
-    return []
+    """GET /features?title=<pattern> (the API filters on eno_id, name and title only)."""
+    items, _probe = search_by_title(dsx, ("/features",), query)
+    return items
 
 
 def fetch_program_by_name(dsx: DsxSession, name: str, *, service_id: str = "", brand_id: str = "") -> Optional[dict[str, Any]]:
